@@ -59,7 +59,7 @@ logger = logging.getLogger("agents")
 RESUMES_DIR = Path(__file__).resolve().parent.parent / "resumes"
 RESUME_AI_PATH = RESUMES_DIR / "resume_ai.txt"
 BACKGROUND_PATH = RESUMES_DIR / "my_background.txt"
-
+_llm_instance = None
 
 def get_llm() -> LLM:
     global _llm_instance

@@ -7,3 +7,5 @@ resumes/
 data/
 output/
 __pycache__/
+credentials.json
+token.json

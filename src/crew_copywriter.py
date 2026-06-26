@@ -3,18 +3,20 @@ crew_copywriter.py
 Phase 4 orchestration: Segmented Copy Generation.
 
 Pulls every 'Ready for Draft' lead, runs the outreach_copywriter agent
-(from agents.py) to write a cold email, appends it to
-output/cold_email_drafts.md, and flips status to 'Drafted'.
+to write a cold email, appends it to output/cold_email_drafts.md,
+saves it as a Gmail draft (with resume attached and LinkedIn/GitHub
+links in the footer), and flips status to 'Drafted'.
 
-Single-track decision in effect: build_draft_task() in agents.py always
-loads resume_ai.txt, there is no category branching here anymore.
+Gmail draft creation is non-fatal: if it fails for any lead (missing
+credentials.json, API error, etc.) the markdown file still gets the
+draft and the lead still gets marked Drafted. The summary dict includes
+a gmail_drafted count so you can see exactly what landed in Gmail vs
+what needs to be copy-pasted manually.
 
-A per-lead failure (Groq error, rate limit, anything) is logged and
-that lead is left at 'Ready for Draft' for a retry on the next run,
-rather than crashing the whole batch or silently marking it Drafted
-with no actual content.
+A per-lead LLM failure leaves the lead at 'Ready for Draft' for retry.
 
-Dependencies: crewai (already required by agents.py)
+Dependencies: crewai, google-auth-oauthlib, google-auth-httplib2,
+              google-api-python-client
 Expected location: src/crew_copywriter.py
 """
 
@@ -30,19 +32,13 @@ from crewai import Crew
 
 import db
 from agents import build_draft_task, get_outreach_copywriter
+from gmail_draft import create_gmail_draft
 
 logger = logging.getLogger("crew_copywriter")
 
 DEFAULT_OUTPUT_PATH = Path(__file__).resolve().parent.parent / "output" / "cold_email_drafts.md"
 
-# Pause between Groq calls. Conservative default, free-tier rate limits
-# vary by account, raise this if you start seeing rate-limit errors in
-# the failed count.
 DRAFT_DELAY_SECONDS = 2.0
-
-# Word count past which a draft gets flagged in the logs, not blocked,
-# just a visibility signal that something ran long against the
-# under-150-word target in the task prompt.
 WORD_COUNT_WARNING_THRESHOLD = 170
 
 EM_DASH_PATTERN = re.compile(r"\s*[—–]\s*")
@@ -61,7 +57,7 @@ def sanitize_draft(text: str) -> str:
     one regardless of what the model actually outputs.
     """
     text = EM_DASH_PATTERN.sub(", ", text)
-    text = re.sub(r",\s*,", ",", text)  # collapse a double comma the replace can create
+    text = re.sub(r",\s*,", ",", text)
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
 
@@ -93,6 +89,20 @@ def append_draft_to_file(
 
 
 # ---------------------------------------------------------------------------
+# Email subject line builder
+# ---------------------------------------------------------------------------
+
+
+def build_subject(company_name: str) -> str:
+    """
+    Build a subject line for the cold email. Kept short and direct,
+    no 'Re:' prefix or spam-trigger words like 'Opportunity' or 'Urgent'.
+    """
+    clean = company_name.split("(")[0].strip()  # drop parenthetical suffixes
+    return f"AI Engineer Application - {clean}"
+
+
+# ---------------------------------------------------------------------------
 # Single draft
 # ---------------------------------------------------------------------------
 
@@ -118,13 +128,15 @@ def run_draft_batch(
     """
     Draft every 'Ready for Draft' lead.
 
-    If conn is None, opens and owns a real on-disk connection via
-    db.get_connection(), closing it before returning. Pass an
-    in-memory connection explicitly for testing.
+    For each lead:
+    1. Generates the cold email body via the LLM agent
+    2. Appends to cold_email_drafts.md (always, before Gmail attempt)
+    3. Creates a Gmail draft with resume attached and links in footer
+    4. Flips status to 'Drafted'
 
-    A failure on one lead (logged) does not stop the batch and does
-    not advance that lead's status, it stays 'Ready for Draft' and
-    will be retried the next time this runs.
+    An LLM failure leaves the lead at 'Ready for Draft' for retry.
+    A Gmail failure is logged but the lead is still marked Drafted
+    since the markdown file already has the content.
     """
     owns_connection = conn is None
     if conn is None:
@@ -135,11 +147,14 @@ def run_draft_batch(
         ready_rows = db.get_leads_by_status(conn, "Ready for Draft")
         drafted = 0
         failed = 0
+        gmail_drafted = 0
 
         for row in ready_rows:
             try:
                 body = draft_one_email(row["company_name"], row["domain"])
 
+                # Step 1: always write to markdown first so content is
+                # never lost even if the Gmail step fails
                 append_draft_to_file(
                     output_path,
                     company_name=row["company_name"],
@@ -147,6 +162,30 @@ def run_draft_batch(
                     email=row["contact_email"],
                     body=body,
                 )
+
+                # Step 2: save to Gmail Drafts if we have a contact email
+                if row["contact_email"]:
+                    subject = build_subject(row["company_name"])
+                    draft_id = create_gmail_draft(
+                        to=row["contact_email"],
+                        subject=subject,
+                        body=body,
+                    )
+                    if draft_id:
+                        gmail_drafted += 1
+                    else:
+                        logger.warning(
+                            "Gmail draft not created for '%s', "
+                            "copy from cold_email_drafts.md manually.",
+                            row["company_name"],
+                        )
+                else:
+                    logger.info(
+                        "No email address for '%s', skipping Gmail draft.",
+                        row["company_name"],
+                    )
+
+                # Step 3: mark complete regardless of Gmail outcome
                 db.update_status(conn, row["id"], "Drafted")
                 drafted += 1
 
@@ -156,8 +195,11 @@ def run_draft_batch(
                         "Draft for '%s' ran long: %d words (target under 150)",
                         row["company_name"], word_count,
                     )
-            except Exception as exc:  # noqa: BLE001 - any failure here must not kill the batch
-                logger.error("Failed to draft email for '%s': %s", row["company_name"], exc)
+
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to draft email for '%s': %s", row["company_name"], exc
+                )
                 failed += 1
 
             time.sleep(delay_seconds)
@@ -165,6 +207,7 @@ def run_draft_batch(
         summary = {
             "attempted": len(ready_rows),
             "drafted": drafted,
+            "gmail_drafted": gmail_drafted,
             "failed": failed,
             "output_file": str(output_path),
         }
